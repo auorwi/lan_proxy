@@ -7,6 +7,8 @@
 - 监听 HTTP 代理请求
 - 转发到上游代理 (VPN)
 - 支持 HTTP 和 HTTPS (CONNECT) 请求
+- 支持用户名密码认证 (公网安全)
+- 支持 IP 白名单
 """
 
 import socket
@@ -16,7 +18,11 @@ import logging
 import sys
 import signal
 import argparse
-from typing import Optional, Tuple
+import base64
+import time
+import ipaddress
+from typing import Optional, Tuple, Dict
+from collections import defaultdict
 from utils import (
     load_config, 
     get_local_ip_addresses, 
@@ -36,9 +42,15 @@ connection_stats = {
     'total': 0,
     'active': 0,
     'success': 0,
-    'failed': 0
+    'failed': 0,
+    'auth_failed': 0,
+    'ip_blocked': 0
 }
 stats_lock = threading.Lock()
+
+# 速率限制
+rate_limit_data: Dict[str, list] = defaultdict(list)
+rate_limit_lock = threading.Lock()
 
 
 def setup_logging(level: str) -> logging.Logger:
@@ -52,6 +64,143 @@ def setup_logging(level: str) -> logging.Logger:
     )
     
     return logging.getLogger('LAN-Proxy')
+
+
+def check_ip_whitelist(client_ip: str) -> bool:
+    """
+    检查客户端IP是否在白名单中
+    
+    Args:
+        client_ip: 客户端IP地址
+        
+    Returns:
+        bool: True 表示允许访问
+    """
+    if not config.security.ip_whitelist:
+        return True  # 白名单为空，允许所有IP
+    
+    try:
+        client_addr = ipaddress.ip_address(client_ip)
+        
+        for allowed in config.security.ip_whitelist:
+            try:
+                # 尝试作为网段解析
+                if '/' in allowed:
+                    network = ipaddress.ip_network(allowed, strict=False)
+                    if client_addr in network:
+                        return True
+                else:
+                    # 作为单个IP解析
+                    if client_addr == ipaddress.ip_address(allowed):
+                        return True
+            except ValueError:
+                continue
+        
+        return False
+    except ValueError:
+        return False
+
+
+def check_rate_limit(client_ip: str) -> bool:
+    """
+    检查是否超过速率限制
+    
+    Args:
+        client_ip: 客户端IP地址
+        
+    Returns:
+        bool: True 表示允许访问 (未超限)
+    """
+    if not config.security.rate_limit_enabled:
+        return True
+    
+    current_time = time.time()
+    window_start = current_time - 60  # 1分钟窗口
+    
+    with rate_limit_lock:
+        # 清理过期记录
+        rate_limit_data[client_ip] = [
+            t for t in rate_limit_data[client_ip] if t > window_start
+        ]
+        
+        # 检查是否超限
+        if len(rate_limit_data[client_ip]) >= config.security.rate_limit_per_minute:
+            return False
+        
+        # 记录本次请求
+        rate_limit_data[client_ip].append(current_time)
+        return True
+
+
+def verify_proxy_auth(request_data: bytes) -> Tuple[bool, str]:
+    """
+    验证代理认证
+    
+    Args:
+        request_data: HTTP请求数据
+        
+    Returns:
+        Tuple[bool, str]: (是否通过认证, 用户名或错误信息)
+    """
+    if not config.security.auth_enabled:
+        return True, ""
+    
+    try:
+        request_text = request_data.decode('utf-8', errors='ignore')
+        
+        # 查找 Proxy-Authorization 头
+        for line in request_text.split('\r\n'):
+            if line.lower().startswith('proxy-authorization:'):
+                auth_value = line.split(':', 1)[1].strip()
+                
+                # 解析 Basic 认证
+                if auth_value.lower().startswith('basic '):
+                    encoded = auth_value[6:].strip()
+                    try:
+                        decoded = base64.b64decode(encoded).decode('utf-8')
+                        if ':' in decoded:
+                            username, password = decoded.split(':', 1)
+                            if (username == config.security.username and 
+                                password == config.security.password):
+                                return True, username
+                            else:
+                                return False, "用户名或密码错误"
+                    except Exception:
+                        return False, "认证格式错误"
+        
+        return False, "未提供认证信息"
+    except Exception as e:
+        return False, f"认证解析失败: {e}"
+
+
+def send_auth_required(client_socket: socket.socket):
+    """发送需要认证的响应"""
+    response = (
+        b'HTTP/1.1 407 Proxy Authentication Required\r\n'
+        b'Proxy-Authenticate: Basic realm="LAN Proxy"\r\n'
+        b'Content-Length: 0\r\n'
+        b'\r\n'
+    )
+    try:
+        client_socket.sendall(response)
+    except Exception:
+        pass
+
+
+def send_forbidden(client_socket: socket.socket, reason: str = "Access Denied"):
+    """发送禁止访问的响应"""
+    body = f"<html><body><h1>403 Forbidden</h1><p>{reason}</p></body></html>".encode()
+    response = (
+        b'HTTP/1.1 403 Forbidden\r\n'
+        b'Content-Type: text/html\r\n'
+        f'Content-Length: {len(body)}\r\n'.encode() +
+        b'\r\n' +
+        body
+    )
+    try:
+        client_socket.sendall(response)
+    except Exception:
+        pass
 
 
 def parse_http_request(request_data: bytes) -> Tuple[str, int, str, bytes]:
@@ -277,12 +426,39 @@ def handle_client(client_socket: socket.socket, client_address: Tuple[str, int])
         connection_stats['active'] += 1
     
     try:
+        # ========== 安全检查 ==========
+        
+        # 1. IP 白名单检查
+        if not check_ip_whitelist(client_ip):
+            logger.warning(f"[{client_ip}] IP 不在白名单中，拒绝连接")
+            with stats_lock:
+                connection_stats['ip_blocked'] += 1
+            send_forbidden(client_socket, "IP not allowed")
+            return
+        
+        # 2. 速率限制检查
+        if not check_rate_limit(client_ip):
+            logger.warning(f"[{client_ip}] 超过速率限制，拒绝连接")
+            send_forbidden(client_socket, "Rate limit exceeded")
+            return
+        
         # 接收客户端请求
         client_socket.settimeout(30)
         request_data = client_socket.recv(8192)
         
         if not request_data:
             return
+        
+        # 3. 认证检查
+        auth_passed, auth_info = verify_proxy_auth(request_data)
+        if not auth_passed:
+            logger.warning(f"[{client_ip}] 认证失败: {auth_info}")
+            with stats_lock:
+                connection_stats['auth_failed'] += 1
+            send_auth_required(client_socket)
+            return
+        
+        # ========== 安全检查结束 ==========
         
         # 解析请求
         host, port, method, raw_request = parse_http_request(request_data)
@@ -293,7 +469,10 @@ def handle_client(client_socket: socket.socket, client_address: Tuple[str, int])
             return
         
         if config.logging.show_requests:
-            logger.info(f"[{client_ip}] {method} {host}:{port}")
+            if config.security.auth_enabled and auth_info:
+                logger.info(f"[{client_ip}] [{auth_info}] {method} {host}:{port}")
+            else:
+                logger.info(f"[{client_ip}] {method} {host}:{port}")
         
         # 连接上游代理
         upstream_socket = connect_to_upstream()
