@@ -230,13 +230,17 @@ def forward_data(source: socket.socket, destination: socket.socket,
     return total_bytes
 
 
-def handle_tunnel(client_socket: socket.socket, upstream_socket: socket.socket,
-                  host: str, port: int):
+def handle_tunnel(client_socket, upstream_socket, host, port, send_response=True):
+    # type: (socket.socket, socket.socket, str, int, bool) -> None
     """
     处理 HTTPS 隧道 (CONNECT 方法)
+    
+    Args:
+        send_response: 是否发送 200 Connection Established 响应
     """
-    # 发送连接成功响应给客户端
-    client_socket.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+    # 发送连接成功响应给客户端（如果需要）
+    if send_response:
+        client_socket.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
     
     # 创建双向转发
     client_socket.setblocking(False)
@@ -413,8 +417,8 @@ def handle_client(client_socket, client_address):
                 # HTTPS 隧道 - 直接连接
                 # 告诉客户端连接已建立
                 client_socket.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-                # 建立隧道
-                handle_tunnel(client_socket, target_socket, host, port)
+                # 建立隧道（不再发送响应，因为上面已经发送了）
+                handle_tunnel(client_socket, target_socket, host, port, send_response=False)
             else:
                 # HTTP 请求 - 需要修改请求为相对路径
                 # 将绝对URL转换为相对路径
