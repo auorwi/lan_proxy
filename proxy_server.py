@@ -31,6 +31,7 @@ config = None  # type: Optional[ProxyConfig]
 logger = None  # type: Optional[logging.Logger]
 server_socket = None  # type: Optional[socket.socket]
 running = True
+upstream_available = True  # 上游代理是否可用
 
 # 连接统计
 connection_stats = {
@@ -248,7 +249,8 @@ def handle_tunnel(client_socket: socket.socket, upstream_socket: socket.socket,
         logger.debug(f"隧道处理出错: {e}")
 
 
-def connect_to_upstream() -> Optional[socket.socket]:
+def connect_to_upstream():
+    # type: () -> Optional[socket.socket]
     """
     连接到上游代理
     
@@ -261,16 +263,40 @@ def connect_to_upstream() -> Optional[socket.socket]:
         upstream_socket.connect((config.upstream.host, config.upstream.port))
         return upstream_socket
     except Exception as e:
-        logger.error(f"连接上游代理失败: {e}")
+        logger.error(u"连接上游代理失败: %s" % e)
         return None
 
 
-def handle_client(client_socket: socket.socket, client_address: Tuple[str, int]):
+def connect_direct(host, port):
+    # type: (str, int) -> Optional[socket.socket]
+    """
+    直接连接到目标服务器（不通过上游代理）
+    
+    Args:
+        host: 目标主机
+        port: 目标端口
+        
+    Returns:
+        Optional[socket.socket]: 目标服务器套接字，失败返回 None
+    """
+    try:
+        target_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        target_socket.settimeout(30)
+        target_socket.connect((host, port))
+        return target_socket
+    except Exception as e:
+        logger.error(u"直接连接目标服务器失败 %s:%d - %s" % (host, port, e))
+        return None
+
+
+def handle_client(client_socket, client_address):
+    # type: (socket.socket, Tuple[str, int]) -> None
     """
     处理客户端连接
     """
+    global upstream_available
     client_ip = client_address[0]
-    upstream_socket = None
+    target_socket = None
     success = False
     
     # 更新统计
@@ -291,53 +317,99 @@ def handle_client(client_socket: socket.socket, client_address: Tuple[str, int])
         
         if not host:
             # 这通常是浏览器的预连接探测或空请求，属于正常行为
-            logger.debug(f"[{client_ip}] 无法解析请求 (可能是预连接探测)")
+            logger.debug(u"[%s] 无法解析请求 (可能是预连接探测)" % client_ip)
             return
         
         if config.logging.show_requests:
-            logger.info(f"[{client_ip}] {method} {host}:{port}")
+            mode = "PROXY" if upstream_available else "DIRECT"
+            logger.info(u"[%s] [%s] %s %s:%d" % (client_ip, mode, method, host, port))
         
-        # 连接上游代理
-        upstream_socket = connect_to_upstream()
-        if not upstream_socket:
-            client_socket.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
-            return
-        
-        if method == 'CONNECT':
-            # HTTPS 隧道
-            # 发送 CONNECT 请求到上游代理
-            connect_request = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
-            upstream_socket.sendall(connect_request.encode())
+        if upstream_available:
+            # ======== 通过上游代理转发 ========
+            target_socket = connect_to_upstream()
+            if not target_socket:
+                client_socket.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+                return
             
-            # 读取上游代理响应
-            response = upstream_socket.recv(4096)
-            
-            if b'200' in response:
-                # 建立隧道
-                handle_tunnel(client_socket, upstream_socket, host, port)
+            if method == 'CONNECT':
+                # HTTPS 隧道 - 通过上游代理
+                connect_request = "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (host, port, host, port)
+                target_socket.sendall(connect_request.encode())
+                
+                # 读取上游代理响应
+                response = target_socket.recv(4096)
+                
+                if b'200' in response:
+                    # 建立隧道
+                    handle_tunnel(client_socket, target_socket, host, port)
+                else:
+                    # 上游代理拒绝连接
+                    client_socket.sendall(response)
             else:
-                # 上游代理拒绝连接
-                client_socket.sendall(response)
-        else:
-            # HTTP 请求 - 直接转发
-            upstream_socket.sendall(raw_request)
-            
-            # 接收并转发响应
-            while True:
-                try:
-                    response_data = upstream_socket.recv(8192)
-                    if not response_data:
+                # HTTP 请求 - 转发到上游代理
+                target_socket.sendall(raw_request)
+                
+                # 接收并转发响应
+                while True:
+                    try:
+                        response_data = target_socket.recv(8192)
+                        if not response_data:
+                            break
+                        client_socket.sendall(response_data)
+                    except socket.timeout:
                         break
-                    client_socket.sendall(response_data)
-                except socket.timeout:
-                    break
-                except Exception:
-                    break
+                    except Exception:
+                        break
+        else:
+            # ======== 直接连接目标服务器 ========
+            target_socket = connect_direct(host, port)
+            if not target_socket:
+                client_socket.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+                return
+            
+            if method == 'CONNECT':
+                # HTTPS 隧道 - 直接连接
+                # 告诉客户端连接已建立
+                client_socket.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+                # 建立隧道
+                handle_tunnel(client_socket, target_socket, host, port)
+            else:
+                # HTTP 请求 - 需要修改请求为相对路径
+                # 将绝对URL转换为相对路径
+                request_text = raw_request.decode('utf-8', errors='ignore')
+                lines = request_text.split('\r\n')
+                if lines:
+                    first_line = lines[0]
+                    parts = first_line.split(' ')
+                    if len(parts) >= 3 and parts[1].startswith('http://'):
+                        # 提取路径部分
+                        url = parts[1]
+                        path_start = url.find('/', 7)  # 跳过 http://
+                        if path_start != -1:
+                            parts[1] = url[path_start:]
+                        else:
+                            parts[1] = '/'
+                        lines[0] = ' '.join(parts)
+                        raw_request = '\r\n'.join(lines).encode()
+                
+                target_socket.sendall(raw_request)
+                
+                # 接收并转发响应
+                while True:
+                    try:
+                        response_data = target_socket.recv(8192)
+                        if not response_data:
+                            break
+                        client_socket.sendall(response_data)
+                    except socket.timeout:
+                        break
+                    except Exception:
+                        break
         
         success = True
                     
     except Exception as e:
-        logger.debug(f"[{client_ip}] 处理请求时出错: {e}")
+        logger.debug(u"[%s] 处理请求时出错: %s" % (client_ip, e))
     finally:
         # 更新统计
         with stats_lock:
@@ -347,9 +419,9 @@ def handle_client(client_socket: socket.socket, client_address: Tuple[str, int])
             else:
                 connection_stats['failed'] += 1
         
-        if upstream_socket:
+        if target_socket:
             try:
-                upstream_socket.close()
+                target_socket.close()
             except:
                 pass
         try:
@@ -398,7 +470,7 @@ def parse_args():
 
 def main():
     """主函数"""
-    global config, logger, server_socket, running
+    global config, logger, server_socket, running, upstream_available
     
     # 解析命令行参数
     args = parse_args()
@@ -407,10 +479,10 @@ def main():
     try:
         config = load_config(args.config)
     except FileNotFoundError as e:
-        print(f"❌ 错误: {e}")
+        print(u"❌ 错误: %s" % e)
         sys.exit(1)
     except Exception as e:
-        print(f"❌ 配置加载失败: {e}")
+        print(u"❌ 配置加载失败: %s" % e)
         sys.exit(1)
     
     # 设置日志
@@ -424,9 +496,10 @@ def main():
     
     # 检查上游代理
     if args.skip_check:
-        print("⏭️  跳过上游代理检查")
+        print(u"⏭️  跳过上游代理检查")
+        upstream_available = True
     else:
-        print("🔍 正在检查上游代理...")
+        print(u"🔍 正在检查上游代理...")
         is_healthy, message = check_upstream_proxy(
             config.upstream,
             config.health_check.test_url,
@@ -434,23 +507,13 @@ def main():
         )
         
         if is_healthy:
-            print(f"✅ {message}")
+            print(u"✅ %s" % message)
+            upstream_available = True
         else:
-            print(f"❌ {message}")
+            print(u"❌ %s" % message)
             print()
-            print("⚠️  警告: 上游代理不可用，代理服务仍将启动，但可能无法正常工作。")
-            print("   请检查 VPN 是否已启动，端口配置是否正确。")
-            print()
-            
-            # 询问是否继续
-            try:
-                response = input("是否继续启动? (y/n): ").strip().lower()
-                if response != 'y':
-                    print("已取消启动。")
-                    sys.exit(0)
-            except KeyboardInterrupt:
-                print("\n已取消启动。")
-                sys.exit(0)
+            print(u"⚠️  上游代理不可用，将使用直连模式（服务器出口IP）")
+            upstream_available = False
     
     print()
     
@@ -466,17 +529,18 @@ def main():
         server_socket.listen(100)
         server_socket.settimeout(1)  # 允许检查 running 标志
         
-        logger.info(f"🚀 代理服务器已启动，监听 {config.server.host}:{config.server.port}")
-        logger.info("按 Ctrl+C 停止服务器")
+        mode_str = u"代理模式" if upstream_available else u"直连模式"
+        logger.info(u"🚀 代理服务器已启动 [%s]，监听 %s:%d" % (mode_str, config.server.host, config.server.port))
+        logger.info(u"按 Ctrl+C 停止服务器")
         print()
         
     except PermissionError:
-        print(f"❌ 错误: 没有权限绑定端口 {config.server.port}")
-        print("   如果端口小于 1024，需要 root 权限")
+        print(u"❌ 错误: 没有权限绑定端口 %d" % config.server.port)
+        print(u"   如果端口小于 1024，需要 root 权限")
         sys.exit(1)
     except OSError as e:
-        print(f"❌ 错误: 无法绑定端口 {config.server.port}: {e}")
-        print("   端口可能已被占用")
+        print(u"❌ 错误: 无法绑定端口 %d: %s" % (config.server.port, e))
+        print(u"   端口可能已被占用")
         sys.exit(1)
     
     # 主循环
