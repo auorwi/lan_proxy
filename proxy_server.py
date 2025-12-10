@@ -105,12 +105,34 @@ def parse_http_request(request_data: bytes) -> Tuple[str, int, str, bytes]:
         
         # CONNECT 方法 (HTTPS)
         if method == 'CONNECT':
-            host_port = url.split(':')
-            host = host_port[0]
-            try:
-                port = int(host_port[1]) if len(host_port) > 1 else 443
-            except ValueError:
-                port = 443
+            # 处理 IPv6 地址格式 [ipv6]:port
+            if url.startswith('['):
+                # IPv6 地址
+                bracket_end = url.find(']')
+                if bracket_end != -1:
+                    host = url[1:bracket_end]
+                    if len(url) > bracket_end + 2 and url[bracket_end + 1] == ':':
+                        try:
+                            port = int(url[bracket_end + 2:])
+                        except ValueError:
+                            port = 443
+                    else:
+                        port = 443
+                else:
+                    host = url
+                    port = 443
+            else:
+                # IPv4 或域名
+                if ':' in url:
+                    last_colon = url.rfind(':')
+                    host = url[:last_colon]
+                    try:
+                        port = int(url[last_colon + 1:])
+                    except ValueError:
+                        port = 443
+                else:
+                    host = url
+                    port = 443
             return host, port, method, request_data
         
         # 普通 HTTP 请求
@@ -271,19 +293,39 @@ def connect_direct(host, port):
     # type: (str, int) -> Optional[socket.socket]
     """
     直接连接到目标服务器（不通过上游代理）
+    支持 IPv4、IPv6 和域名解析
     
     Args:
-        host: 目标主机
+        host: 目标主机（域名、IPv4 或 IPv6 地址）
         port: 目标端口
         
     Returns:
         Optional[socket.socket]: 目标服务器套接字，失败返回 None
     """
     try:
-        target_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        target_socket.settimeout(30)
-        target_socket.connect((host, port))
-        return target_socket
+        # 处理 IPv6 地址格式 [xxxx:xxxx:...]
+        if host.startswith('[') and host.endswith(']'):
+            host = host[1:-1]
+        
+        # 使用 getaddrinfo 支持 IPv4/IPv6 和 DNS 解析
+        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        
+        # 尝试连接第一个可用地址
+        for family, socktype, proto, canonname, sockaddr in addr_info:
+            try:
+                target_socket = socket.socket(family, socktype, proto)
+                target_socket.settimeout(30)
+                target_socket.connect(sockaddr)
+                return target_socket
+            except socket.error:
+                continue
+        
+        logger.error(u"无法连接到目标服务器 %s:%d - 所有地址都失败" % (host, port))
+        return None
+        
+    except socket.gaierror as e:
+        logger.error(u"DNS解析失败 %s - %s" % (host, e))
+        return None
     except Exception as e:
         logger.error(u"直接连接目标服务器失败 %s:%d - %s" % (host, port, e))
         return None
