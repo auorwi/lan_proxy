@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 工具函数模块
 提供网络检测、配置加载等功能
@@ -42,24 +43,12 @@ class HealthCheckConfig:
 
 
 @dataclass
-class SecurityConfig:
-    """安全配置"""
-    auth_enabled: bool
-    username: str
-    password: str
-    ip_whitelist: List[str]
-    rate_limit_enabled: bool
-    rate_limit_per_minute: int
-
-
-@dataclass
 class ProxyConfig:
     """完整代理配置"""
     server: ServerConfig
     upstream: UpstreamConfig
     logging: LoggingConfig
     health_check: HealthCheckConfig
-    security: SecurityConfig
 
 
 def load_config(config_path: str = "config.yaml") -> ProxyConfig:
@@ -101,22 +90,11 @@ def load_config(config_path: str = "config.yaml") -> ProxyConfig:
         timeout=config_data.get('health_check', {}).get('timeout', 10)
     )
     
-    security_data = config_data.get('security', {})
-    security = SecurityConfig(
-        auth_enabled=security_data.get('auth_enabled', False),
-        username=security_data.get('username', 'admin'),
-        password=security_data.get('password', ''),
-        ip_whitelist=security_data.get('ip_whitelist', []),
-        rate_limit_enabled=security_data.get('rate_limit_enabled', False),
-        rate_limit_per_minute=security_data.get('rate_limit_per_minute', 100)
-    )
-    
     return ProxyConfig(
         server=server,
         upstream=upstream,
         logging=logging_cfg,
-        health_check=health_check,
-        security=security
+        health_check=health_check
     )
 
 
@@ -269,26 +247,7 @@ def print_banner(config: ProxyConfig, ip_addresses: List[Tuple[str, str]]):
         print(f"   • 代理服务器: {primary_ip}")
         print(f"   • 代理端口: {config.server.port}")
         print(f"   • 代理类型: HTTP")
-        if config.security.auth_enabled:
-            print(f"   • 认证: 需要用户名密码")
-        else:
-            print(f"   • 认证: 无需认证")
-    print()
-    
-    # 安全状态
-    print("🔒 安全设置:")
-    if config.security.auth_enabled:
-        print(f"   • 认证: ✅ 已启用")
-    else:
-        print(f"   • 认证: ❌ 未启用")
-    if config.security.ip_whitelist:
-        print(f"   • IP白名单: ✅ 已启用 ({len(config.security.ip_whitelist)} 条规则)")
-    else:
-        print(f"   • IP白名单: ❌ 未启用 (允许所有IP)")
-    if config.security.rate_limit_enabled:
-        print(f"   • 速率限制: ✅ {config.security.rate_limit_per_minute} 请求/分钟")
-    else:
-        print(f"   • 速率限制: ❌ 未启用")
+        print(f"   • 认证: 无需认证")
     print()
 
 
