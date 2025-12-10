@@ -1,0 +1,5 @@
+# 局域网代理工具依赖
+# LAN Proxy Dependencies
+
+# YAML 配置解析
+PyYAML>=6.0
