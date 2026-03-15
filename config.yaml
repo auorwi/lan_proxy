@@ -14,7 +14,7 @@ upstream:
   host: "127.0.0.1"
   # 上游代理端口
   port: 15236
-  # 代理类型: http 或 socks5
+  # 代理类型: http, https 或 socks5
   type: "http"
 
 # 日志配置

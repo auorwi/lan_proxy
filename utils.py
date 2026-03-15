@@ -170,7 +170,8 @@ def check_upstream_proxy(upstream: UpstreamConfig, test_url: str, timeout: int) 
     Returns:
         Tuple[bool, str]: (是否可用, 消息)
     """
-    proxy_url = f"http://{upstream.host}:{upstream.port}"
+    scheme = "https" if upstream.proxy_type == "https" else "http"
+    proxy_url = f"{scheme}://{upstream.host}:{upstream.port}"
     
     # 首先检查端口是否开放
     try:

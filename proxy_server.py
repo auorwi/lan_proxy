@@ -11,6 +11,7 @@
 """
 
 import socket
+import ssl
 import threading
 import select
 import logging
@@ -279,7 +280,7 @@ def connect_to_upstream():
     # type: () -> Optional[socket.socket]
     """
     连接到上游代理
-    
+
     Returns:
         Optional[socket.socket]: 上游代理套接字，失败返回 None
     """
@@ -287,6 +288,12 @@ def connect_to_upstream():
         upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         upstream_socket.settimeout(30)
         upstream_socket.connect((config.upstream.host, config.upstream.port))
+        if config.upstream.proxy_type == 'https':
+            context = ssl.create_default_context()
+            upstream_socket = context.wrap_socket(
+                upstream_socket,
+                server_hostname=config.upstream.host
+            )
         return upstream_socket
     except Exception as e:
         logger.error(u"连接上游代理失败: %s" % e)
