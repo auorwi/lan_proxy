@@ -235,45 +235,43 @@ def handle_tunnel(client_socket, upstream_socket, host, port, send_response=True
     # type: (socket.socket, socket.socket, str, int, bool) -> None
     """
     处理 HTTPS 隧道 (CONNECT 方法)
-    
+    使用双线程双向转发，兼容 SSL socket（SSL socket 不支持 select 非阻塞模式）
+
     Args:
         send_response: 是否发送 200 Connection Established 响应
     """
-    # 发送连接成功响应给客户端（如果需要）
     if send_response:
         client_socket.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-    
-    # 创建双向转发
-    client_socket.setblocking(False)
-    upstream_socket.setblocking(False)
-    
-    try:
-        while running:
-            readable, _, exceptional = select.select(
-                [client_socket, upstream_socket], 
-                [], 
-                [client_socket, upstream_socket],
-                1
-            )
-            
-            if exceptional:
-                break
-            
-            for sock in readable:
-                try:
-                    data = sock.recv(8192)
-                    if not data:
-                        return
-                    
-                    if sock is client_socket:
-                        upstream_socket.sendall(data)
-                    else:
-                        client_socket.sendall(data)
-                except (BlockingIOError, socket.error):
-                    continue
-                    
-    except Exception as e:
-        logger.debug(f"隧道处理出错: {e}")
+
+    client_socket.setblocking(True)
+    upstream_socket.setblocking(True)
+
+    def pipe(src, dst):
+        # type: (socket.socket, socket.socket) -> None
+        try:
+            while running:
+                data = src.recv(8192)
+                if not data:
+                    break
+                dst.sendall(data)
+        except Exception:
+            pass
+        finally:
+            try:
+                src.close()
+            except Exception:
+                pass
+            try:
+                dst.close()
+            except Exception:
+                pass
+
+    t1 = threading.Thread(target=pipe, args=(client_socket, upstream_socket), daemon=True)
+    t2 = threading.Thread(target=pipe, args=(upstream_socket, client_socket), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
 
 def connect_to_upstream():
